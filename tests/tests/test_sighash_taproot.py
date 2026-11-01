@@ -2,10 +2,11 @@ from binascii import hexlify, unhexlify
 from io import BytesIO
 from unittest import TestCase
 
-from embit import compact
+from embit import compact, hashes
+from embit.psbt import PSBTError
 from embit.psbtview import PSBTView
 from embit.script import Script
-from embit.transaction import Transaction
+from embit.transaction import Transaction, TransactionError
 
 # keyPathSpending of BIP-341's wallet-test-vectors.json
 RAW_TX = (
@@ -75,6 +76,36 @@ SIGHASHES = [
         "cccb739eca6c13a8a89e6e5cd317ffe55669bbda23f2fd37b0f18755e008edd2",
     ),
 ]
+# (input index, hash type, sigMsg) of the vectors with SIGHASH_SINGLE
+SINGLE_SIGMSGS = [
+    (
+        0,
+        0x03,
+        "0003020000000065cd1de3b33bb4ef3a52ad1fffb555c0d82828eb22737036eaeb02"
+        "a235d82b909c4c3f58a6964a4f5f8f0b642ded0a8a553be7622a719da71d1f5befce"
+        "fcdee8e0fde623ad0f61ad2bca5ba6a7693f50fce988e17c3780bf2b1e720cfbb38f"
+        "bdd52e2118959c7221ab5ce9e26c3cd67b22c24f8baa54bac281d8e6b05e400e6c3a"
+        "957e0000000000d0418f0e9a36245b9a50ec87f8bf5be5bcae434337b87139c3a5b1"
+        "f56e33cba0",
+    ),
+    (
+        1,
+        0x83,
+        "0083020000000065cd1d00d7b7cab57b1393ace2d064f4d4a2cb8af6def61273e127"
+        "517d44759b6dafdd9900000000808f891b00000000225120147c9c57132f6e7ecddb"
+        "a9800bb0c4449251c92a1e60371ee77557b6620f3ea3ffffffffffcef8fb4ca7efc5"
+        "433f591ecfc57391811ce1e186a3793024def5c884cba51d",
+    ),
+]
+
+
+def psbtview():
+    # a BIP-174 PSBT built by hand, so that the sequences of 0 reach the
+    # view unchanged: PSBT.serialize() would write them as 0xFFFFFFFF (#146)
+    raw = unhexlify(RAW_TX)
+    psbt = b"psbt\xff\x01\x00" + compact.to_bytes(len(raw)) + raw + b"\x00"
+    psbt += b"\x00" * (len(UTXOS) + 2)  # empty maps, 9 inputs and 2 outputs
+    return PSBTView.view(BytesIO(psbt))
 
 
 class SighashTaprootTest(TestCase):
@@ -89,9 +120,30 @@ class SighashTaprootTest(TestCase):
         self.check(Transaction.parse(unhexlify(RAW_TX)))
 
     def test_psbtview(self):
-        # a BIP-174 PSBT built by hand, so that the sequences of 0 reach the
-        # view unchanged: PSBT.serialize() would write them as 0xFFFFFFFF (#146)
-        raw = unhexlify(RAW_TX)
-        psbt = b"psbt\xff\x01\x00" + compact.to_bytes(len(raw)) + raw + b"\x00"
-        psbt += b"\x00" * (len(UTXOS) + 2)  # empty maps, 9 inputs and 2 outputs
-        self.check(PSBTView.view(BytesIO(psbt)))
+        self.check(psbtview())
+
+    def test_single_commits_to_the_hash_of_the_output(self):
+        tx = Transaction.parse(unhexlify(RAW_TX))
+        values = [value for value, _ in UTXOS]
+        scripts = [Script(unhexlify(spk)) for _, spk in UTXOS]
+        for i, sighash, sigmsg in SINGLE_SIGMSGS:
+            msg = unhexlify(sigmsg)
+            self.assertEqual(msg[-32:], hashes.sha256(tx.vout[i].serialize()))
+            self.assertEqual(
+                tx.sighash_taproot(i, scripts, values, sighash=sighash),
+                hashes.tagged_hash("TapSighash", msg),
+            )
+
+    def test_single_without_a_corresponding_output(self):
+        tx = Transaction.parse(unhexlify(RAW_TX))
+        values = [value for value, _ in UTXOS]
+        scripts = [Script(unhexlify(spk)) for _, spk in UTXOS]
+        msg = "No corresponding output for SIGHASH_SINGLE"
+        for i in [2, 8]:
+            for sighash in [0x03, 0x83]:
+                with self.assertRaises(TransactionError) as exc:
+                    tx.sighash_taproot(i, scripts, values, sighash=sighash)
+                self.assertEqual(str(exc.exception), msg)
+                with self.assertRaises(PSBTError) as exc:
+                    psbtview().sighash_taproot(i, scripts, values, sighash=sighash)
+                self.assertEqual(str(exc.exception), msg)

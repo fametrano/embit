@@ -250,6 +250,8 @@ class Transaction(EmbitBase):
         if annex is not None:
             h.update(hashes.sha256(compact.to_bytes(len(annex)) + annex))
         if sh == SIGHASH.SINGLE:
+            if input_index >= len(self.vout):
+                raise TransactionError("No corresponding output for SIGHASH_SINGLE")
             h.update(hashes.sha256(self.vout[input_index].serialize()))
         if script is not None:
             h.update(
